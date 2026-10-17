@@ -1,0 +1,78 @@
+name: Bootstrap V2 IPA build
+
+on:
+  workflow_dispatch:
+    inputs:
+      paid_account:
+        description: "Include extra-memory entitlements where available"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: ${{ github.event.repository.private }}
+    runs-on: macos-15
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify private repository and migration archive
+        run: |
+          test "${{ github.event.repository.private }}" = "true"
+          test -f gta5-ios-port-v2-migration-candidate-fixed.zip
+
+      - name: Extract the migration candidate
+        run: |
+          mkdir -p "$RUNNER_TEMP/candidate"
+          unzip -oq gta5-ios-port-v2-migration-candidate-fixed.zip -d "$RUNNER_TEMP/candidate"
+          ROOT="$RUNNER_TEMP/candidate/gta5-ios-port-1.4"
+          test -f "$ROOT/build_ipa.sh"
+          cp -a "$ROOT/." "$GITHUB_WORKSPACE/"
+          chmod +x build_ipa.sh check_v2_inputs.sh
+
+      - name: Validate V2 engine and shader inputs
+        run: |
+          ./check_v2_inputs.sh
+          mkdir -p "$RUNNER_TEMP/game-files/b/8b0b5899ed/shaders"
+          unzip -oq build-inputs/v2-core-files.zip -d "$RUNNER_TEMP/game-files"
+          unzip -oq build-inputs/v2-shader-packs.zip -d "$RUNNER_TEMP/game-files/b/8b0b5899ed/shaders"
+          /usr/bin/python3 app/Scripts/check_game_files.py --mirror "$RUNNER_TEMP/game-files"
+
+      - name: Install Xcode project generator
+        run: brew install xcodegen
+
+      - name: Ensure Metal toolchain is available
+        run: xcrun -sdk iphoneos metal --version >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+
+      - name: Build unsigned IPA (diagnostic; not yet device-verified)
+        env:
+          JOBS: "2"
+        run: |
+          if [ "${{ inputs.paid_account }}" = "true" ]; then
+            ./build_ipa.sh --mirror "$RUNNER_TEMP/game-files"
+          else
+            ./build_ipa.sh --mirror "$RUNNER_TEMP/game-files" --free
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: V2-build-diagnostics
+          path: |
+            app/Build/input-check.log
+            app/Build/prepare.log
+            app/Build/xcodebuild.log
+            app/Build/import-status.tsv
+            app/Generated/funcnames.tsv
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: GTA5Port-ipa
+          path: GTA5Port.ipa
+          retention-days: 3
