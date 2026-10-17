@@ -1,0 +1,98 @@
+name: Build GTA V2 iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      paid_account:
+        description: "Request the larger-memory build configuration"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: ${{ github.event.repository.private }}
+    runs-on: macos-15
+    timeout-minutes: 240
+    steps:
+      - name: Verify repository is private
+        run: |
+          test "${{ github.event.repository.private }}" = "true" || {
+            echo "::error::This build must run from a private repository."
+            exit 1
+          }
+
+      - uses: actions/checkout@v4
+
+      - name: Unpack migration candidate
+        run: |
+          test -f gta5-ios-port-v2-migration-candidate-fixed.zip || {
+            echo "::error::Upload gta5-ios-port-v2-migration-candidate-fixed.zip to the repository root first."
+            exit 1
+          }
+          mkdir -p "$RUNNER_TEMP/v2-package"
+          unzip -oq gta5-ios-port-v2-migration-candidate-fixed.zip -d "$RUNNER_TEMP/v2-package"
+          src="$(find "$RUNNER_TEMP/v2-package" -maxdepth 4 -type f -name build_ipa.sh -print -quit | xargs dirname)"
+          test -n "$src" || { echo "::error::Could not find build_ipa.sh inside the archive."; exit 1; }
+          echo "SOURCE_DIR=$src" >> "$GITHUB_ENV"
+          echo "Using source: $src"
+
+      - name: Validate bundled V2 inputs
+        working-directory: ${{ runner.temp }}/v2-package
+        run: |
+          src="$(find . -maxdepth 4 -type f -name check_v2_inputs.sh -print -quit)"
+          test -n "$src" || { echo "::error::check_v2_inputs.sh not found."; exit 1; }
+          bash "$src"
+
+      - name: Assemble V2 engine and shader packs
+        working-directory: ${{ env.SOURCE_DIR }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/game-files/b/8b0b5899ed/shaders"
+          unzip -oq build-inputs/v2-core-files.zip -d "$RUNNER_TEMP/game-files"
+          unzip -oq build-inputs/v2-shader-packs.zip -d "$RUNNER_TEMP/game-files/b/8b0b5899ed/shaders"
+          python3 app/Scripts/check_game_files.py --mirror "$RUNNER_TEMP/game-files"
+
+      - name: Install build tools
+        run: brew install xcodegen
+
+      - name: Make sure Metal toolchain is installed
+        run: xcrun -sdk iphoneos metal --version >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+
+      - name: Build unsigned IPA
+        working-directory: ${{ env.SOURCE_DIR }}
+        env:
+          JOBS: "2"
+        run: |
+          ./build_ipa.sh --mirror "$RUNNER_TEMP/game-files" ${{ !inputs.paid_account && '--free' || '' }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: V2-build-diagnostics
+          path: |
+            ${{ env.SOURCE_DIR }}/app/Build/input-check.log
+            ${{ env.SOURCE_DIR }}/app/Build/prepare.log
+            ${{ env.SOURCE_DIR }}/app/Build/xcodebuild.log
+            ${{ env.SOURCE_DIR }}/app/Build/import-status.tsv
+            ${{ env.SOURCE_DIR }}/app/Generated/funcnames.tsv
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: GTA5Port-ipa
+          path: ${{ env.SOURCE_DIR }}/GTA5Port.ipa
+          retention-days: 3
+
+      - name: Publish IPA to private release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ipa="${{ runner.temp }}/v2-package"
+          find "$ipa" -name GTA5Port.ipa -type f -print
+          gh release delete latest-ipa --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest-ipa "${{ env.SOURCE_DIR }}/GTA5Port.ipa" --repo "${{ github.repository }}" --title "V2 iOS build $(date -u +%Y-%m-%d)" --notes "Unsigned diagnostic IPA. Install and test on a compatible device; a successful build does not prove runtime compatibility."
