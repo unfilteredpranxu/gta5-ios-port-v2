@@ -41,6 +41,20 @@ jobs:
           echo "SOURCE_DIR=$src" >> "$GITHUB_ENV"
           echo "Reconstructed and validated archive."
 
+      - name: Fix WABT memory64 flag for pinned version
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          p = Path(os.environ["SOURCE_DIR"]) / "app/Scripts/prepare.py"
+          source = p.read_text()
+          old = "'--enable-threads', '--enable-memory64', '--no-debug-names'"
+          new = "'--enable-threads', '--no-debug-names'"
+          if old not in source:
+              raise SystemExit("Expected wasm2c argument sequence not found; refusing to patch.")
+          p.write_text(source.replace(old, new, 1))
+          print("Removed unsupported --enable-memory64 switch; memory64 is enabled by default in this WABT CLI.")
+
       - name: Validate V2 inputs and scripts
         run: |
           bash "$SOURCE_DIR/check_v2_inputs.sh"
