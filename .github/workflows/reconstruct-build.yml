@@ -41,19 +41,23 @@ jobs:
           echo "SOURCE_DIR=$src" >> "$GITHUB_ENV"
           echo "Reconstructed and validated archive."
 
-      - name: Fix WABT memory64 flag for pinned version
+      - name: Apply pinned-tool compatibility adjustment
         run: |
-          python3 - <<'PY'
-          import os
+          python3 - "$SOURCE_DIR/app/Scripts/prepare.py" <<'PY'
+          import sys
           from pathlib import Path
-          p = Path(os.environ["SOURCE_DIR"]) / "app/Scripts/prepare.py"
+          p = Path(sys.argv[1])
           source = p.read_text()
           old = "'--enable-threads', '--enable-memory64', '--no-debug-names'"
           new = "'--enable-threads', '--no-debug-names'"
-          if old not in source:
-              raise SystemExit("Expected wasm2c argument sequence not found; refusing to patch.")
-          p.write_text(source.replace(old, new, 1))
-          print("Removed unsupported --enable-memory64 switch; memory64 is enabled by default in this WABT CLI.")
+          if old in source:
+              p.write_text(source.replace(old, new, 1))
+              print("Removed wasm2c CLI switch unsupported by the pinned tool build.")
+          elif new in source:
+              print("wasm2c CLI argument sequence already compatible.")
+          else:
+              raise SystemExit("Could not identify the expected wasm2c argument sequence; refusing an unsafe patch.")
+          PY
 
       - name: Make the optional Scaleform workaround tolerant of V2 body changes
         run: |
@@ -61,16 +65,28 @@ jobs:
           import sys
           from pathlib import Path
           p = Path(sys.argv[1])
-          s = p.read_text()
+          source = p.read_text()
           old = "raise RuntimeError(f'Pinned f{REQUEST} (CommandRequestScaleformMovieCommon) changed')"
           replacement = "print(f'WARNING: V2 Scaleform body differs in {path.name}; skipping optional workaround.'); raise SystemExit(0)"
-          if replacement in s:
-              print("Scaleform compatibility adjustment already present.")
-          elif old in s:
-              p.write_text(s.replace(old, replacement, 1))
-              print("Scaleform mismatch now skips only this optional workaround; remaining preparation continues.")
+          missing = "if not done: raise RuntimeError(f'Pinned function f{REQUEST} not found')"
+          missing_replacement = "if not done: print('WARNING: V2 Scaleform function not found; skipping optional workaround.'); raise SystemExit(0)"
+          changed = False
+          if replacement not in source:
+              if old not in source:
+                  raise SystemExit("Scaleform guard text did not match expected source; refusing an unsafe edit.")
+              source = source.replace(old, replacement, 1)
+              changed = True
+          if missing_replacement not in source:
+              if missing not in source:
+                  raise SystemExit("Scaleform function guard text did not match expected source; refusing an unsafe edit.")
+              source = source.replace(missing, missing_replacement, 1)
+              changed = True
+          if changed:
+              p.write_text(source)
+              print("Patched optional Scaleform fallback to skip only when V2's generated C is incompatible.")
           else:
-              raise SystemExit("Scaleform guard text did not match the expected source; refusing an unsafe edit.")
+              print("Scaleform compatibility adjustment already present.")
+          compile(source, str(p), "exec")
           PY
 
       - name: Validate V2 inputs and scripts
@@ -94,30 +110,50 @@ jobs:
         env:
           JOBS: "2"
         run: |
+          set -euo pipefail
           if [ "${{ inputs.paid_account }}" = "true" ]; then
             "$SOURCE_DIR/build_ipa.sh" --mirror "$RUNNER_TEMP/game-files"
           else
             "$SOURCE_DIR/build_ipa.sh" --mirror "$RUNNER_TEMP/game-files" --free
           fi
 
+      - name: Stage IPA in workspace
+        if: success()
+        run: cp "$SOURCE_DIR/GTA5Port.ipa" "$GITHUB_WORKSPACE/GTA5Port.ipa"
+
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          set +e
+          mkdir -p "$GITHUB_WORKSPACE/diagnostics"
+          if [ -n "${SOURCE_DIR:-}" ]; then
+            for name in input-check.log prepare.log xcodebuild.log import-status.tsv; do
+              if [ -f "$SOURCE_DIR/app/Build/$name" ]; then
+                cp "$SOURCE_DIR/app/Build/$name" "$GITHUB_WORKSPACE/diagnostics/$name"
+              fi
+            done
+            if [ -f "$SOURCE_DIR/app/Generated/funcnames.tsv" ]; then
+              cp "$SOURCE_DIR/app/Generated/funcnames.tsv" "$GITHUB_WORKSPACE/diagnostics/funcnames.tsv"
+            fi
+          fi
+          if [ -f "$RUNNER_TEMP/candidate.zip" ]; then
+            unzip -tq "$RUNNER_TEMP/candidate.zip" > "$GITHUB_WORKSPACE/diagnostics/archive-integrity.txt" 2>&1
+            echo "archive-integrity-exit=$?" >> "$GITHUB_WORKSPACE/diagnostics/archive-integrity.txt"
+          fi
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: V2-build-diagnostics
-          path: |
-            ${{ env.SOURCE_DIR }}/app/Build/input-check.log
-            ${{ env.SOURCE_DIR }}/app/Build/prepare.log
-            ${{ env.SOURCE_DIR }}/app/Build/xcodebuild.log
-            ${{ env.SOURCE_DIR }}/app/Build/import-status.tsv
-            ${{ env.SOURCE_DIR }}/app/Generated/funcnames.tsv
-          if-no-files-found: ignore
+          path: diagnostics/
+          if-no-files-found: warn
           retention-days: 7
 
       - uses: actions/upload-artifact@v4
         if: success()
         with:
           name: GTA5Port-ipa
-          path: ${{ env.SOURCE_DIR }}/GTA5Port.ipa
+          path: GTA5Port.ipa
           retention-days: 3
 
       - name: Publish private release
@@ -126,4 +162,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete latest-ipa --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
-          gh release create latest-ipa "${{ env.SOURCE_DIR }}/GTA5Port.ipa" --repo "${{ github.repository }}" --title "V2 iOS diagnostic build $(date -u +%Y-%m-%d)" --notes "Unsigned diagnostic IPA. A successful build does not establish runtime compatibility; test on a compatible iPad."
+          gh release create latest-ipa GTA5Port.ipa --repo "${{ github.repository }}" --title "V2 iOS diagnostic build $(date -u +%Y-%m-%d)" --notes "Unsigned diagnostic IPA. A successful build does not establish runtime compatibility; test on a compatible iPad."
