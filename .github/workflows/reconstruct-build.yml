@@ -1,0 +1,97 @@
+name: Reconstruct and Build V2 IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      paid_account:
+        description: "Use the extra-memory entitlement configuration"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: ${{ github.event.repository.private }}
+    runs-on: macos-15
+    timeout-minutes: 240
+    steps:
+      - name: Refuse public repository
+        run: |
+          test "${{ github.event.repository.private }}" = "true" || {
+            echo "::error::This workflow must run in a private repository."
+            exit 1
+          }
+
+      - uses: actions/checkout@v4
+
+      - name: Reconstruct migration archive from uploaded parts
+        run: |
+          set -euo pipefail
+          for f in gta5-v2-package.part00 gta5-v2-package.part01 gta5-v2-package.part02; do
+            test -s "$f" || { echo "::error::Missing or empty upload part: $f"; exit 1; }
+          done
+          cat gta5-v2-package.part00 gta5-v2-package.part01 gta5-v2-package.part02 > "$RUNNER_TEMP/candidate.zip"
+          unzip -tq "$RUNNER_TEMP/candidate.zip"
+          mkdir -p "$RUNNER_TEMP/package"
+          unzip -oq "$RUNNER_TEMP/candidate.zip" -d "$RUNNER_TEMP/package"
+          src="$(find "$RUNNER_TEMP/package" -maxdepth 5 -type f -name build_ipa.sh -print -quit | xargs dirname)"
+          test -n "$src" || { echo "::error::Could not locate build_ipa.sh in reconstructed archive."; exit 1; }
+          echo "SOURCE_DIR=$src" >> "$GITHUB_ENV"
+          echo "Reconstructed and validated archive."
+
+      - name: Validate V2 inputs and scripts
+        run: |
+          bash "$SOURCE_DIR/check_v2_inputs.sh"
+
+      - name: Assemble bundled V2 engine and shader packs
+        run: |
+          mkdir -p "$RUNNER_TEMP/game-files/b/8b0b5899ed/shaders"
+          unzip -oq "$SOURCE_DIR/build-inputs/v2-core-files.zip" -d "$RUNNER_TEMP/game-files"
+          unzip -oq "$SOURCE_DIR/build-inputs/v2-shader-packs.zip" -d "$RUNNER_TEMP/game-files/b/8b0b5899ed/shaders"
+          python3 "$SOURCE_DIR/app/Scripts/check_game_files.py" --mirror "$RUNNER_TEMP/game-files"
+
+      - name: Install build tools
+        run: brew install xcodegen
+
+      - name: Ensure Metal toolchain is installed
+        run: xcrun -sdk iphoneos metal --version >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+
+      - name: Build unsigned IPA
+        env:
+          JOBS: "2"
+        run: |
+          if [ "${{ inputs.paid_account }}" = "true" ]; then
+            "$SOURCE_DIR/build_ipa.sh" --mirror "$RUNNER_TEMP/game-files"
+          else
+            "$SOURCE_DIR/build_ipa.sh" --mirror "$RUNNER_TEMP/game-files" --free
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: V2-build-diagnostics
+          path: |
+            ${{ env.SOURCE_DIR }}/app/Build/input-check.log
+            ${{ env.SOURCE_DIR }}/app/Build/prepare.log
+            ${{ env.SOURCE_DIR }}/app/Build/xcodebuild.log
+            ${{ env.SOURCE_DIR }}/app/Build/import-status.tsv
+            ${{ env.SOURCE_DIR }}/app/Generated/funcnames.tsv
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: GTA5Port-ipa
+          path: ${{ env.SOURCE_DIR }}/GTA5Port.ipa
+          retention-days: 3
+
+      - name: Publish private release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest-ipa --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest-ipa "${{ env.SOURCE_DIR }}/GTA5Port.ipa" --repo "${{ github.repository }}" --title "V2 iOS diagnostic build $(date -u +%Y-%m-%d)" --notes "Unsigned diagnostic IPA. A successful build does not establish runtime compatibility; test on a compatible iPad."
